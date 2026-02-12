@@ -184,7 +184,7 @@ const showStoryProgress = computed(() => currentStoryIndex.value >= 0);
 
 function getNextValentineDate() {
   const now = new Date();
-  const target = new Date(now.getFullYear(), 1, 10, 0, 0, 0);
+  const target = new Date(now.getFullYear(), 1, 14, 0, 0, 0);
   // if (now > target) {
   //   return new Date(now.getFullYear() + 1, 1, 14, 0, 0, 0);
   // }
