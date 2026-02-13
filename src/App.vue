@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'gallery-active': currentScreen === 'gallery' || isPhotoModalOpen }">
     <div class="ambient-bg" aria-hidden="true">
       <span
         v-for="item in floatingItems"
@@ -68,8 +68,8 @@
 
           <template v-else-if="currentScreen === 'welcome'">
             <p class="eyebrow">Our Love Story</p>
-            <h1 class="title">I made this little world for you</h1>
-            <p class="subtitle">Tap the envelope and let the surprise unfold.</p>
+            <h1 class="title">Happy Valentine's Baby</h1>
+            <p class="subtitle"></p>
             <EnvelopeCard
               :opening="envelopeOpening"
               @open="openEnvelope"
@@ -108,15 +108,24 @@
             <h2 class="title">The way I see you</h2>
             <div class="photo-grid">
               <button
-                v-for="photo in galleryPhotos"
+                v-for="photo in visibleGalleryPhotos"
                 :key="photo.src"
+                v-memo="[photo.src]"
                 class="photo-card"
                 type="button"
-                @click="openPhoto(photo)"
+                @pointerdown="onPhotoPointerDown($event)"
+                @pointermove="onPhotoPointerMove($event)"
+                @pointerup="onPhotoPointerUp(photo, $event)"
+                @pointercancel="onPhotoPointerCancel"
+                @pointerleave="onPhotoPointerLeave($event)"
+                @click.prevent
+                @keydown.enter.prevent="openPhoto(photo)"
+                @keydown.space.prevent="openPhoto(photo)"
               >
-                <img :src="photo.src" :alt="photo.alt" loading="lazy" />
+                <img :src="photo.src" :alt="photo.alt" loading="lazy" decoding="async" />
               </button>
             </div>
+            <div ref="galleryLoadSentinel" class="gallery-sentinel" aria-hidden="true"></div>
             <button class="btn-primary" type="button" @click="goTo('final')">Final surprise</button>
           </template>
 
@@ -143,7 +152,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { gsap } from 'gsap';
 import EnvelopeCard from './components/EnvelopeCard.vue';
 import PhotoModal from './components/PhotoModal.vue';
@@ -168,11 +177,27 @@ const bgMusic = ref(null);
 const transitionFromScreen = ref('');
 const transitionToScreen = ref('');
 const storyScreens = ['welcome', 'letter', 'timeline', 'gallery', 'final'];
+const galleryLoadSentinel = ref(null);
+const galleryBatchSize = 18;
+const galleryVisibleCount = ref(galleryBatchSize);
+const PHOTO_CACHE_KEY = 'valentine_photo_cache_v1';
+const photoLocalCache = ref({});
+const photoTap = ref({
+  activePointerId: null,
+  startX: 0,
+  startY: 0,
+  startTs: 0,
+  moved: false
+});
+const lastGalleryScrollAt = ref(0);
+let galleryObserver = null;
+let preloadIdleId = null;
+let preloadTimeoutId = null;
 
 let countdownTimer = null;
 let typingTimer = null;
 
-const anniversaryDate = new Date('2022-02-14T00:00:00');
+const anniversaryDate = new Date('2025-06-14T00:00:00');
 const unlockDate = getNextValentineDate();
 
 const daysTogether = computed(() => {
@@ -181,10 +206,11 @@ const daysTogether = computed(() => {
 });
 const currentStoryIndex = computed(() => storyScreens.indexOf(currentScreen.value));
 const showStoryProgress = computed(() => currentStoryIndex.value >= 0);
+const visibleGalleryPhotos = computed(() => galleryPhotos.slice(0, galleryVisibleCount.value));
 
 function getNextValentineDate() {
   const now = new Date();
-  const target = new Date(now.getFullYear(), 1, 14, 0, 0, 0);
+  const target = new Date(now.getFullYear(), 1, 10, 0, 0, 0);
   // if (now > target) {
   //   return new Date(now.getFullYear() + 1, 1, 14, 0, 0, 0);
   // }
@@ -228,9 +254,18 @@ function startCountdown() {
 function goTo(screen, options = {}) {
   if (currentScreen.value === screen) return;
   const fromEnvelope = Boolean(options.fromEnvelope);
+  const fromGalleryToFinal = currentScreen.value === 'gallery' && screen === 'final';
   transitionFromScreen.value = currentScreen.value;
   transitionToScreen.value = screen;
   isTransitioning.value = !fromEnvelope;
+
+  // Stop gallery background work immediately before leaving gallery
+  if (currentScreen.value === 'gallery' && galleryObserver) {
+    galleryObserver.disconnect();
+    galleryObserver = null;
+    clearGalleryPreloadSchedule();
+  }
+
   setTimeout(() => {
     currentScreen.value = screen;
     if (screen === 'letter') {
@@ -238,6 +273,16 @@ function goTo(screen, options = {}) {
       letterFromEnvelopeIntro.value = false;
       setTimeout(() => {
         startTypewriter();
+      }, 120);
+    }
+    if (screen === 'gallery') {
+      nextTick(() => {
+        setupGalleryObserver();
+      });
+    } else if (fromGalleryToFinal) {
+      // Keep next visits smooth by reducing gallery DOM after transition
+      setTimeout(() => {
+        galleryVisibleCount.value = galleryBatchSize;
       }, 120);
     }
     setTimeout(() => {
@@ -279,8 +324,75 @@ function startTypewriter() {
 }
 
 function openPhoto(photo) {
-  selectedPhoto.value = photo;
+  if (!photo || hasRecentGalleryScroll(140)) return;
+  if (isPhotoModalOpen.value && selectedPhoto.value?.src === photo.src) return;
+  const cachedSrc = photoLocalCache.value[photo.src];
+  selectedPhoto.value = {
+    ...photo,
+    modalSrc: cachedSrc || photo.src
+  };
   isPhotoModalOpen.value = true;
+  preloadPhotoDecode(photo.src);
+
+  if (!cachedSrc) {
+    cachePhotoForModal(photo.src).then((dataUrl) => {
+      if (!dataUrl) return;
+      if (
+        isPhotoModalOpen.value &&
+        selectedPhoto.value &&
+        selectedPhoto.value.src === photo.src
+      ) {
+        selectedPhoto.value = {
+          ...selectedPhoto.value,
+          modalSrc: dataUrl
+        };
+      }
+    });
+  }
+}
+
+function onPhotoPointerDown(event) {
+  if (hasRecentGalleryScroll(120)) return;
+  photoTap.value = {
+    activePointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    startTs: performance.now(),
+    moved: false
+  };
+}
+
+function onPhotoPointerMove(event) {
+  if (photoTap.value.activePointerId !== event.pointerId) return;
+  const dx = Math.abs(event.clientX - photoTap.value.startX);
+  const dy = Math.abs(event.clientY - photoTap.value.startY);
+  if (dx > 10 || dy > 10) {
+    photoTap.value.moved = true;
+  }
+}
+
+function onPhotoPointerLeave(event) {
+  if (photoTap.value.activePointerId !== event.pointerId) return;
+  photoTap.value.moved = true;
+}
+
+function onPhotoPointerCancel() {
+  photoTap.value.activePointerId = null;
+  photoTap.value.moved = true;
+}
+
+function onPhotoPointerUp(photo, event) {
+  if (photoTap.value.activePointerId !== event.pointerId) return;
+
+  const elapsed = performance.now() - photoTap.value.startTs;
+  const isTap = !photoTap.value.moved && elapsed < 320 && !hasRecentGalleryScroll(150);
+
+  photoTap.value.activePointerId = null;
+  photoTap.value.moved = false;
+
+  if (isTap) {
+    openPhoto(photo);
+  }
 }
 
 function openValentineModal() {
@@ -341,6 +453,151 @@ function buildFallingItems() {
   fallingItems.value = items;
 }
 
+function loadMoreGalleryItems() {
+  if (galleryVisibleCount.value >= galleryPhotos.length) return;
+  galleryVisibleCount.value = Math.min(
+    galleryPhotos.length,
+    galleryVisibleCount.value + galleryBatchSize
+  );
+  scheduleGalleryPreload();
+}
+
+function setupGalleryObserver() {
+  if (galleryObserver) {
+    galleryObserver.disconnect();
+    galleryObserver = null;
+  }
+  if (!galleryLoadSentinel.value) return;
+
+  galleryObserver = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          loadMoreGalleryItems();
+        }
+      });
+    },
+    { rootMargin: '180px 0px 180px 0px' }
+  );
+  galleryObserver.observe(galleryLoadSentinel.value);
+  scheduleGalleryPreload();
+}
+
+function onWindowScroll() {
+  if (currentScreen.value !== 'gallery') return;
+  lastGalleryScrollAt.value = performance.now();
+}
+
+function hasRecentGalleryScroll(windowMs) {
+  return performance.now() - lastGalleryScrollAt.value < windowMs;
+}
+
+function clearGalleryPreloadSchedule() {
+  if (preloadIdleId !== null && 'cancelIdleCallback' in window) {
+    window.cancelIdleCallback(preloadIdleId);
+    preloadIdleId = null;
+  }
+  if (preloadTimeoutId !== null) {
+    clearTimeout(preloadTimeoutId);
+    preloadTimeoutId = null;
+  }
+}
+
+function preloadPhotoDecode(src) {
+  if (!src) return;
+  const img = new Image();
+  img.decoding = 'async';
+  img.src = src;
+  if (typeof img.decode === 'function') {
+    img.decode().catch(() => {});
+  }
+}
+
+function warmupVisibleGalleryPhotos() {
+  const upperBound = Math.min(galleryVisibleCount.value + 10, galleryPhotos.length);
+  for (let index = 0; index < upperBound; index += 1) {
+    preloadPhotoDecode(galleryPhotos[index].src);
+  }
+}
+
+function scheduleGalleryPreload() {
+  if (currentScreen.value !== 'gallery') return;
+  clearGalleryPreloadSchedule();
+
+  if ('requestIdleCallback' in window) {
+    preloadIdleId = window.requestIdleCallback(
+      () => {
+        preloadIdleId = null;
+        warmupVisibleGalleryPhotos();
+      },
+      { timeout: 800 }
+    );
+    return;
+  }
+
+  preloadTimeoutId = setTimeout(() => {
+    preloadTimeoutId = null;
+    warmupVisibleGalleryPhotos();
+  }, 140);
+}
+
+function loadPhotoCacheFromStorage() {
+  try {
+    const raw = localStorage.getItem(PHOTO_CACHE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      photoLocalCache.value = parsed;
+    }
+  } catch (_) {
+    photoLocalCache.value = {};
+  }
+}
+
+function persistPhotoCache() {
+  try {
+    localStorage.setItem(PHOTO_CACHE_KEY, JSON.stringify(photoLocalCache.value));
+  } catch (_) {
+    // Ignore quota/storage failures and continue with network fallback.
+  }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function cachePhotoForModal(src) {
+  if (!src || photoLocalCache.value[src]) {
+    return photoLocalCache.value[src] || '';
+  }
+
+  try {
+    const response = await fetch(src, { cache: 'force-cache' });
+    if (!response.ok) return '';
+    const blob = await response.blob();
+
+    // Keep localStorage usage conservative on mobile browsers.
+    if (blob.size > 360 * 1024) return '';
+
+    const dataUrl = await blobToDataUrl(blob);
+    if (!dataUrl || dataUrl.length > 520 * 1024) return '';
+
+    photoLocalCache.value = {
+      ...photoLocalCache.value,
+      [src]: dataUrl
+    };
+    persistPhotoCache();
+    return dataUrl;
+  } catch (_) {
+    return '';
+  }
+}
+
 function dropHearts() {
   const layer = document.createElement('div');
   layer.className = 'heart-rain';
@@ -365,6 +622,9 @@ function onScreenEnter(el, done) {
   const isEnvelopeToLetter =
     transitionFromScreen.value === 'welcome' &&
     transitionToScreen.value === 'letter';
+  const isGalleryToFinal =
+    transitionFromScreen.value === 'gallery' &&
+    transitionToScreen.value === 'final';
 
   if (isEnvelopeToLetter) {
     gsap.fromTo(
@@ -374,6 +634,24 @@ function onScreenEnter(el, done) {
         opacity: 1,
         duration: 0.55,
         ease: 'power2.out',
+        onComplete: () => {
+          transitionFromScreen.value = '';
+          transitionToScreen.value = '';
+          done();
+        }
+      }
+    );
+    return;
+  }
+
+  if (isGalleryToFinal) {
+    gsap.fromTo(
+      el,
+      { opacity: 0.92 },
+      {
+        opacity: 1,
+        duration: 0.24,
+        ease: 'power1.out',
         onComplete: () => {
           transitionFromScreen.value = '';
           transitionToScreen.value = '';
@@ -403,12 +681,25 @@ function onScreenLeave(el, done) {
   const isEnvelopeToLetter =
     transitionFromScreen.value === 'welcome' &&
     transitionToScreen.value === 'letter';
+  const isGalleryToFinal =
+    transitionFromScreen.value === 'gallery' &&
+    transitionToScreen.value === 'final';
 
   if (isEnvelopeToLetter) {
     gsap.to(el, {
       opacity: 0,
       duration: 0.34,
       ease: 'power2.inOut',
+      onComplete: done
+    });
+    return;
+  }
+
+  if (isGalleryToFinal) {
+    gsap.to(el, {
+      opacity: 0,
+      duration: 0.18,
+      ease: 'power1.inOut',
       onComplete: done
     });
     return;
@@ -468,14 +759,19 @@ async function toggleMusic() {
 }
 
 onMounted(() => {
+  loadPhotoCacheFromStorage();
   buildFloatingItems();
   buildFallingItems();
   startCountdown();
   tryAutoplayMusic();
+  window.addEventListener('scroll', onWindowScroll, { passive: true });
 });
 
 onBeforeUnmount(() => {
   if (countdownTimer) clearInterval(countdownTimer);
   if (typingTimer) clearTimeout(typingTimer);
+  if (galleryObserver) galleryObserver.disconnect();
+  clearGalleryPreloadSchedule();
+  window.removeEventListener('scroll', onWindowScroll);
 });
 </script>

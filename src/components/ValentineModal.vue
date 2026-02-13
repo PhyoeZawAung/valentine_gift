@@ -1,5 +1,5 @@
 <template>
-  <div v-if="modelValue" class="modal-shell" @click.self="$emit('update:modelValue', false)">
+  <div v-if="modelValue" class="modal-shell open" @click.self="$emit('update:modelValue', false)">
     <article class="modal-card valentine" ref="cardRef">
       <span class="valentine-deco deco-left" aria-hidden="true">❤</span>
       <span class="valentine-deco deco-right" aria-hidden="true">💌</span>
